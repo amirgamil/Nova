@@ -23,6 +23,7 @@ pub mod errors;
 pub mod gadgets;
 pub mod provider;
 pub mod spartan;
+pub mod groth16;
 pub mod traits;
 
 use crate::bellperson::{
