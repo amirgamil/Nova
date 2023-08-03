@@ -1,8 +1,11 @@
+use std::{sync::Arc, marker::PhantomData};
+
 use ff::PrimeField;
-use pairing::{MultiMillerLoop, Engine};
+use pairing::{MultiMillerLoop};
 // use serde::{Deserialize, Serialize};
-use ec_gpu_gen::multiexp_cpu::{DensityTracker}; 
-use bellperson::{groth16::{VerifyingKey, prepare_verifying_key, generate_random_parameters}, ConstraintSystem, SynthesisError, gadgets::num::AllocatedNum};
+use bellperson::{groth16::{VerifyingKey, prepare_verifying_key, generate_random_parameters, create_random_proof, verify_proof, Proof}, ConstraintSystem, SynthesisError, gadgets::num::AllocatedNum};
+use rand_core::{OsRng};
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use crate::{
   errors::NovaError,
   r1cs::{R1CSShape, RelaxedR1CSInstance, RelaxedR1CSWitness},
@@ -14,6 +17,7 @@ use crate::{
 // #[derive(Serialize, Deserialize)]
 // #[serde(bound = "")]
 pub struct ProverKey<E: MultiMillerLoop> {
+  pub vk: VerifierKey<E>,
   // Elements of the form ((tau^i * t(tau)) / delta) for i between 0 and
   // m-2 inclusive. Never contains points at infinity.
   pub h: Arc<Vec<E::G1Affine>>,
@@ -38,19 +42,21 @@ pub struct ProverKey<E: MultiMillerLoop> {
 /// A type that represents the verifier's key
 // #[derive(Serialize, Deserialize)]
 // #[serde(bound = "")]
-pub struct VerifierKey<E: Engine + MultiMillerLoop> {
+pub struct VerifierKey<E: MultiMillerLoop> {
   vk: VerifyingKey<E>,
 }
 
 
 // struct to construct a bellpearson circuit from a Nova R1CS representation
-#[derive(Clone)]
-pub struct R1CSBellpersonCircuit<Fr: PrimeField> {
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(bound(deserialize = ""))] //TODO: fix deserialize
+pub struct R1CSBellpersonCircuit<G: Group, Fr: PrimeField> {
   //TODO: implement circuit which satisfier circuit trait in bellpearson given R1CS shape?  
-  pub r1cs: R1CSShape<Fr>,
+  pub r1cs: R1CSShape<G>,
+  _marker: PhantomData<Fr>,
 }
 
-impl<'a, Fr: PrimeField> R1CSBellpersonCircuit<Fr> {
+impl<G: Group, Fr: PrimeField> R1CSBellpersonCircuit<G, Fr> {
     fn synthesize<CS: ConstraintSystem<Fr>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
       assert_eq!(self.r1cs.A.len(), self.r1cs.B.len());
       assert_eq!(self.r1cs.B.len(), self.r1cs.C.len());
@@ -70,13 +76,37 @@ impl<'a, Fr: PrimeField> R1CSBellpersonCircuit<Fr> {
 }
 
 
+fn serialize_empty<S>(_value: &(), serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str("")
+}
+
+fn deserialize_empty<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _s: String = Deserialize::deserialize(deserializer)?;
+    Ok(())
+}
+
+// #[derive(Serialize, Deserialize)]
+pub struct RelaxedR1CSSNARK<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> {
+  // #[serde(serialize_with = "serialize_empty", deserialize_with = "deserialize_empty")]
+  pub circuit: R1CSBellpersonCircuit<G, G::Scalar>,
+  // #[serde(serialize_with = "serialize_empty", deserialize_with = "deserialize_empty")]
+  pub proof: Proof<EE>,
+  inputs: Vec<G::Scalar>
+}
 
 
-impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G>
+
+impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> RelaxedR1CSSNARKTrait<G>
   for RelaxedR1CSSNARK<G, EE>
 {
-  type ProverKey = ProverKey<G, EE>;
-  type VerifierKey = VerifierKey<G, EE>;
+  type ProverKey = ProverKey<EE>;
+  type VerifierKey = VerifierKey<EE>;
 
    fn setup(
     ck: &CommitmentKey<G>,
@@ -84,41 +114,49 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE>> RelaxedR1CSSNARKTrait<G
   ) -> Result<(Self::ProverKey, Self::VerifierKey), NovaError> {
     // Create parameters for our circuit
     
+    let rng: &mut OsRng = &mut OsRng::new().unwrap();
     //TODO: this is expecting the R1CS representation, but we only know the R1CS shape
     let c: R1CSBellpersonCircuit<G> = R1CSBellpersonCircuit {
       r1cs: S,
+      _marker: PhantomData
     };
 
     // TODO: need to define a struct that is the union of both EE and MultiMillerLoop
-    let params:  = {
+    let params: ProverKey<EE> = {
         // define c circuit
         generate_random_parameters(c, &mut *rng).unwrap()
     };
 
-    let pk= ProverKey {
-      h: params.h,
-      l: params.l,
-      a: params.a,
-      b_g1: params.b_g1,
-      b_g2: params.b_g2
-    };
 
     // Prepare the verification key (for proof verification)
     let vk = prepare_verifying_key(&params.vk);
 
-    Ok((pk, vk))
+
+    Ok((params, vk))
   }
 
   fn prove(
+    &self,
     ck: &CommitmentKey<G>,
     pk: &Self::ProverKey,
     U: &RelaxedR1CSInstance<G>,
     W: &RelaxedR1CSWitness<G>,
   ) -> Result<Self, NovaError> {
-    //TODO
+    let rng: &mut OsRng = &mut OsRng::new().unwrap();
+    let proof = create_random_proof(self.circuit, &pk, rng);
+    //TODO: get from witness instead of just passing 0s
+    let mut public_inputs: Vec<G::Scalar> = vec![G::Scalar::ZERO; self.circuit.r1cs.num_io];
+
+    // TODO: confirm inputs are prefix of the witness not suffic
+    for i in 0..self.circuit.r1cs.num_inputs {
+      public_inputs[i] = W.inputs[i];
+    }
+
+    Ok(RelaxedR1CSSNARK { circuit: self.circuit.clone(), proof: proof, inputs: &public_inputs })
   }
 
   fn verify(&self, vk: &Self::VerifierKey, U: &RelaxedR1CSInstance<G>) -> Result<(), NovaError> {
     //TODO
+    verify_proof(vk, &self.proof, &self.public_inputs)
   }
 }
