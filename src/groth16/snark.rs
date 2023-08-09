@@ -4,7 +4,7 @@ use ff::PrimeField;
 use pairing::{MultiMillerLoop};
 // use serde::{Deserialize, Serialize};
 use bellperson::{groth16::{VerifyingKey, prepare_verifying_key, generate_random_parameters, create_random_proof, verify_proof, Proof}, ConstraintSystem, SynthesisError, gadgets::num::AllocatedNum};
-use rand_core::{OsRng};
+use rand_core::{OsRng, RngCore};
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use crate::{
   errors::NovaError,
@@ -14,8 +14,6 @@ use crate::{
 };
 
 /// A type that represents the prover's key
-// #[derive(Serialize, Deserialize)]
-// #[serde(bound = "")]
 pub struct ProverKey<E: MultiMillerLoop> {
   pub vk: VerifierKey<E>,
   // Elements of the form ((tau^i * t(tau)) / delta) for i between 0 and
@@ -46,13 +44,43 @@ pub struct VerifierKey<E: MultiMillerLoop> {
   vk: VerifyingKey<E>,
 }
 
+impl<E: MultiMillerLoop> Serialize for ProverKey<E> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize to some empty representation
+        serializer.serialize_unit()
+    }
+}
+
+impl<'de, E: MultiMillerLoop> Deserialize<'de> for ProverKey<E> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // You'll need to provide the logic here to create an instance of RelaxedR1CSSNARK
+        // You can return an error or perhaps a default value
+        Err(serde::de::Error::custom("Cannot deserialize"))
+    }
+}
+
+impl<E: MultiMillerLoop> Serialize for VerifierKey<E> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize to some empty representation
+        serializer.serialize_unit()
+    }
+}
+
+impl<'de, E: MultiMillerLoop> Deserialize<'de> for VerifierKey<E> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // You'll need to provide the logic here to create an instance of RelaxedR1CSSNARK
+        // You can return an error or perhaps a default value
+        Err(serde::de::Error::custom("Cannot deserialize"))
+    }
+}
+
 
 // struct to construct a bellpearson circuit from a Nova R1CS representation
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = ""))] //TODO: fix deserialize
 pub struct R1CSBellpersonCircuit<G: Group, Fr: PrimeField> {
   //TODO: implement circuit which satisfier circuit trait in bellpearson given R1CS shape?  
-  pub r1cs: R1CSShape<G>,
+  pub r1cs: Option<R1CSShape<G>>,
   _marker: PhantomData<Fr>,
 }
 
@@ -76,30 +104,26 @@ impl<G: Group, Fr: PrimeField> R1CSBellpersonCircuit<G, Fr> {
 }
 
 
-fn serialize_empty<S>(_value: &(), serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str("")
-}
-
-fn deserialize_empty<'de, D>(deserializer: D) -> Result<(), D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let _s: String = Deserialize::deserialize(deserializer)?;
-    Ok(())
-}
-
-// #[derive(Serialize, Deserialize)]
 pub struct RelaxedR1CSSNARK<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> {
-  // #[serde(serialize_with = "serialize_empty", deserialize_with = "deserialize_empty")]
   pub circuit: R1CSBellpersonCircuit<G, G::Scalar>,
-  // #[serde(serialize_with = "serialize_empty", deserialize_with = "deserialize_empty")]
   pub proof: Proof<EE>,
   inputs: Vec<G::Scalar>
 }
 
+impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> Serialize for RelaxedR1CSSNARK<G, EE> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize to some empty representation
+        serializer.serialize_unit()
+    }
+}
+
+impl<'de, G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> Deserialize<'de> for RelaxedR1CSSNARK<G, EE> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // You'll need to provide the logic here to create an instance of RelaxedR1CSSNARK
+        // You can return an error or perhaps a default value
+        Err(serde::de::Error::custom("Cannot deserialize"))
+    }
+}
 
 
 impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> RelaxedR1CSSNARKTrait<G>
@@ -114,9 +138,9 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> Relax
   ) -> Result<(Self::ProverKey, Self::VerifierKey), NovaError> {
     // Create parameters for our circuit
     
-    let rng: &mut OsRng = &mut OsRng::new().unwrap();
+    let rng: OsRng = OsRng::new().unwrap();
     //TODO: this is expecting the R1CS representation, but we only know the R1CS shape
-    let c: R1CSBellpersonCircuit<G> = R1CSBellpersonCircuit {
+    let c: R1CSBellpersonCircuit<G, G::Scalar> = R1CSBellpersonCircuit {
       r1cs: S,
       _marker: PhantomData
     };
@@ -124,12 +148,12 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> Relax
     // TODO: need to define a struct that is the union of both EE and MultiMillerLoop
     let params: ProverKey<EE> = {
         // define c circuit
-        generate_random_parameters(c, &mut *rng).unwrap()
+        generate_random_parameters::<EE, R1CSBellpersonCircuit<G, G::Scalar>, RngCore>(c, &mut *rng).unwrap()
     };
 
 
     // Prepare the verification key (for proof verification)
-    let vk = prepare_verifying_key(&params.vk);
+    let vk = prepare_verifying_key<EE>(&params.vk);
 
 
     Ok((params, vk))
@@ -157,6 +181,8 @@ impl<G: Group, EE: EvaluationEngineTrait<G, CE = G::CE> + MultiMillerLoop> Relax
 
   fn verify(&self, vk: &Self::VerifierKey, U: &RelaxedR1CSInstance<G>) -> Result<(), NovaError> {
     //TODO
-    verify_proof(vk, &self.proof, &self.public_inputs)
+    let result = verify_proof(vk, &self.proof, &self.public_inputs)
+    assert!(result, "proof is invalid");
+    return result;
   }
 }
